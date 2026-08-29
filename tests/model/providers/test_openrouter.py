@@ -510,3 +510,101 @@ async def test_messages_to_openai_replays_reasoning_content_for_deepseek_v4() ->
     payload = converted[0]
     assert payload["reasoning_content"] == "considered options"  # type: ignore[typeddict-item]
     assert "reasoning_details" in payload
+
+
+# --- content-block / content_filter handling (issue #5108) ---
+
+import httpx as _httpx2
+from openai import APIStatusError as _APIStatusError
+
+from inspect_ai.model._providers.openrouter import (
+    OpenRouterContentBlockError,
+    OpenRouterError,
+)
+
+
+def _on_response(api: OpenRouterAPI, response: dict[str, Any]) -> Any:
+    return api.on_response(response)
+
+
+def test_on_response_raises_content_block_for_provider_block() -> None:
+    api = _make_api("openrouter/google/gemini-flash")
+    with pytest.raises(OpenRouterContentBlockError):
+        _on_response(
+            api,
+            {
+                "error": {
+                    "code": 400,
+                    "message": "Gemini blocked the request: PROHIBITED_CONTENT",
+                }
+            },
+        )
+
+
+def test_on_response_raises_content_block_for_moderation_metadata() -> None:
+    api = _make_api("openrouter/google/gemini-flash")
+    with pytest.raises(OpenRouterContentBlockError):
+        _on_response(
+            api,
+            {
+                "error": {
+                    "code": 403,
+                    "message": "Your input was flagged by moderation",
+                    "metadata": {"reasons": ["harmful content"]},
+                }
+            },
+        )
+
+
+def test_on_response_leaves_other_provider_errors_fatal() -> None:
+    api = _make_api("openrouter/google/gemini-flash")
+    with pytest.raises(OpenRouterError) as excinfo:
+        _on_response(
+            api,
+            {"error": {"code": 400, "message": "model is too busy"}},
+        )
+    assert not isinstance(excinfo.value, OpenRouterContentBlockError)
+
+
+def test_handle_bad_request_converts_openrouter_block_to_content_filter() -> None:
+    api = _make_api("openrouter/google/gemini-flash")
+    body = {
+        "error": {
+            "code": 400,
+            "message": "Gemini blocked the request: PROHIBITED_CONTENT",
+        }
+    }
+    error = _APIStatusError(
+        message="Error 400 - Gemini blocked the request: PROHIBITED_CONTENT",
+        response=_httpx2.Response(
+            status_code=400,
+            json=body,
+            request=_httpx2.Request(
+                "POST", "https://openrouter.ai/api/v1/chat/completions"
+            ),
+        ),
+        body=body,
+    )
+    output = api.handle_bad_request(error)
+    assert isinstance(output, ModelOutput)
+    assert output.stop_reason == "content_filter"
+    assert output.choices[0].message.text is not None
+    assert "PROHIBITED_CONTENT" in output.choices[0].message.text
+
+
+def test_handle_bad_request_passes_through_unrelated_400() -> None:
+    api = _make_api("openrouter/google/gemini-flash")
+    body = {"error": {"code": 400, "message": "model is too busy"}}
+    error = _APIStatusError(
+        message="Error 400 - model is too busy",
+        response=_httpx2.Response(
+            status_code=400,
+            json=body,
+            request=_httpx2.Request(
+                "POST", "https://openrouter.ai/api/v1/chat/completions"
+            ),
+        ),
+        body=body,
+    )
+    result = api.handle_bad_request(error)
+    assert isinstance(result, Exception)

@@ -1,4 +1,5 @@
 import json
+import re
 from logging import getLogger
 from typing import Any, cast
 
@@ -6,6 +7,7 @@ from openai.types.chat import (
     ChatCompletion,
     ChatCompletionMessageParam,
 )
+from openai import APIStatusError
 from pydantic import JsonValue
 from typing_extensions import NotRequired, TypedDict, override
 
@@ -16,7 +18,11 @@ from inspect_ai.model import _openrouter_reasoning
 from inspect_ai.model._chat_message import ChatMessage
 from inspect_ai.model._model import RetryDecision
 from inspect_ai.model._model_call import ModelCall
-from inspect_ai.model._model_output import ChatCompletionChoice, ModelOutput
+from inspect_ai.model._model_output import (
+    ChatCompletionChoice,
+    ModelOutput,
+    StopDetails,
+)
 from inspect_ai.model._openai import (
     CompletionsReasoningContent,
     OpenAIResponseError,
@@ -67,6 +73,35 @@ class OpenRouterError(Exception):
             if "metadata" in self.response
             else ""
         )
+
+
+# Terminal provider/moderation blocks carry one of these signals per
+# https://openrouter.ai/docs/api-reference/errors :
+#  - moderation errors include metadata.reasons
+#  - provider content blocks read "<Provider> blocked the request: <REASON>"
+_BLOCKED_REQUEST_RE = re.compile(r"blocked the request", re.IGNORECASE)
+
+
+def _is_content_block_error(error: dict[str, Any]) -> bool:
+    metadata = error.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("reasons"):
+        return True
+    message = error.get("message")
+    return isinstance(message, str) and bool(_BLOCKED_REQUEST_RE.search(message))
+
+
+class OpenRouterContentBlockError(OpenRouterError):
+    """A terminal, non-retryable content-policy block (scorable as content_filter)."""
+
+
+def _content_filter_output(model_name: str, error: dict[str, Any]) -> ModelOutput:
+    message = str(error.get("message", "content blocked"))
+    return ModelOutput.from_content(
+        model=model_name,
+        content=f"BLOCKED: {message}",
+        stop_reason="content_filter",
+        stop_details=StopDetails(type="refusal", explanation=message),
+    )
 
 
 class OpenRouterAPI(OpenAICompatibleAPI):
@@ -279,6 +314,11 @@ class OpenRouterAPI(OpenAICompatibleAPI):
                 raise OpenAIResponseError("rate_limit_exceeded", error["message"])
             elif error["code"] in [408, 500, 502, 504]:
                 raise OpenAIResponseError("server_error", error["message"])
+            elif _is_content_block_error(error):
+                # Terminal content-policy/moderation blocks are scorable
+                # outcomes (e.g. refusals in safety benchmarks) rather than
+                # run-aborting errors.
+                raise OpenRouterContentBlockError(error)
             else:
                 raise OpenRouterError(error)
 
@@ -302,12 +342,27 @@ class OpenRouterAPI(OpenAICompatibleAPI):
         # Delegate to the OpenAI-compatible base and post-process usage to
         # surface Anthropic-style cache_creation_input_tokens (which OpenRouter
         # passes through for Anthropic-routed models but the base does not parse).
-        result = await super().generate(input, tools, tool_choice, config)
+        try:
+            result = await super().generate(input, tools, tool_choice, config)
+        except OpenRouterContentBlockError as e:
+            return _content_filter_output(self.service_model_name(), e.response)
+
         if isinstance(result, tuple):
             output, call = result
             if isinstance(output, ModelOutput):
                 _apply_cache_creation_usage(output, call)
         return result
+
+    @override
+    def handle_bad_request(self, ex: APIStatusError) -> ModelOutput | Exception:
+        # Pre-stream blocks arrive as an HTTP 400 whose OpenRouter-shaped body
+        # ({"error": {"code": <int>, "message": "<provider> blocked the
+        # request: ..."}}) lacks the `type`/string `code` fields the shared
+        # OpenAI bad-request classifier looks for.
+        error = ex.body.get("error") if isinstance(ex.body, dict) else None
+        if isinstance(error, dict) and _is_content_block_error(error):
+            return _content_filter_output(self.service_model_name(), error)
+        return super().handle_bad_request(ex)
 
     @override
     async def _generate_completion(
