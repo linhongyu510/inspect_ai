@@ -2,13 +2,19 @@
 
 from typing import Any
 
+import httpx2
 import pytest
+from openai import APIStatusError
 
 from inspect_ai.model._generate_config import GenerateConfig
 from inspect_ai.model._model_call import ModelCall
 from inspect_ai.model._model_output import ModelOutput, ModelUsage
+from inspect_ai.model._openai import OpenAIResponseError
+from inspect_ai.model._providers.openai_compatible import OpenAICompatibleAPI
 from inspect_ai.model._providers.openrouter import (
     OpenRouterAPI,
+    OpenRouterContentBlockError,
+    OpenRouterError,
     _add_anthropic_cache_markers,
     _apply_cache_creation_usage,
 )
@@ -22,6 +28,21 @@ def _has_cache_control(block: Any) -> bool:
 
 def _make_api(model_name: str, **kwargs: Any) -> OpenRouterAPI:
     return OpenRouterAPI(model_name=model_name, api_key="test-key", **kwargs)
+
+
+def _status_error(error: dict[str, Any]) -> APIStatusError:
+    body = {"error": error}
+    return APIStatusError(
+        message=f"Error {error['code']} - {error['message']}",
+        response=httpx2.Response(
+            status_code=error["code"],
+            json=body,
+            request=httpx2.Request(
+                "POST", "https://openrouter.ai/api/v1/chat/completions"
+            ),
+        ),
+        body=body,
+    )
 
 
 def _make_output(
@@ -540,3 +561,91 @@ def test_openrouter_session_id_omitted_without_active_sample(
     api = _make_api("anthropic/claude-sonnet-4-5")
 
     assert api.request_headers(GenerateConfig()) == {}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"code": 400, "message": "Gemini blocked the request: PROHIBITED_CONTENT"},
+        {
+            "code": 403,
+            "message": "Your input was flagged by moderation",
+            "metadata": {"reasons": ["harmful content"]},
+        },
+    ],
+)
+def test_on_response_raises_content_block(error: dict[str, Any]) -> None:
+    api = _make_api("openrouter/google/gemini-flash")
+    with pytest.raises(OpenRouterContentBlockError):
+        api.on_response({"error": error})
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_error"),
+    [
+        (
+            {"code": 500, "message": "provider failed", "metadata": {"reasons": ["x"]}},
+            OpenAIResponseError,
+        ),
+        (
+            {"code": 403, "message": "forbidden", "metadata": {"reasons": []}},
+            OpenRouterError,
+        ),
+        ({"code": 400, "message": "request blocked by upstream"}, OpenRouterError),
+        (
+            {"code": 400, "message": "Gemini blocked the request: free-form reason"},
+            OpenRouterError,
+        ),
+        ({"code": 400, "message": "model is too busy"}, OpenRouterError),
+    ],
+)
+def test_on_response_does_not_broaden_content_block_detection(
+    error: dict[str, Any], expected_error: type[Exception]
+) -> None:
+    api = _make_api("openrouter/google/gemini-flash")
+    with pytest.raises(expected_error) as excinfo:
+        api.on_response({"error": error})
+    assert not isinstance(excinfo.value, OpenRouterContentBlockError)
+
+
+async def test_generate_converts_response_block_to_scorable_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def blocked_generate(*args: Any, **kwargs: Any) -> ModelOutput:
+        raise OpenRouterContentBlockError(
+            {
+                "code": 400,
+                "message": "Gemini blocked the request: PROHIBITED_CONTENT",
+            }
+        )
+
+    monkeypatch.setattr(OpenAICompatibleAPI, "generate", blocked_generate)
+    api = _make_api("openrouter/google/gemini-flash")
+
+    output = await api.generate([], [], "auto", GenerateConfig())
+
+    assert isinstance(output, ModelOutput)
+    assert output.stop_reason == "content_filter"
+    assert "PROHIBITED_CONTENT" in output.completion
+
+
+def test_handle_bad_request_converts_openrouter_block_to_content_filter() -> None:
+    api = _make_api("openrouter/google/gemini-flash")
+    error = _status_error(
+        {"code": 400, "message": "Gemini blocked the request: PROHIBITED_CONTENT"}
+    )
+    output = api.handle_bad_request(error)
+    assert isinstance(output, ModelOutput)
+    assert output.stop_reason == "content_filter"
+    assert output.choices[0].stop_details is not None
+    assert output.choices[0].stop_details.type == "content_filter"
+    assert output.choices[0].stop_details.explanation is not None
+    assert output.choices[0].message.text is not None
+    assert "PROHIBITED_CONTENT" in output.choices[0].message.text
+
+
+def test_handle_bad_request_passes_through_unrelated_400() -> None:
+    api = _make_api("openrouter/google/gemini-flash")
+    error = _status_error({"code": 400, "message": "model is too busy"})
+    result = api.handle_bad_request(error)
+    assert isinstance(result, Exception)
